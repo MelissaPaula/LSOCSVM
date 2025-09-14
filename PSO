@@ -1,0 +1,182 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error, accuracy_score, confusion_matrix, classification_report
+import pyswarms as ps
+
+#====================#
+# Funções principais #
+#====================#
+
+def rbf_kernel(x1, x2, sigma):
+    return np.exp(-cdist(x1, x2, 'sqeuclidean') / (2 * sigma**2))
+
+def lsocsvm_fit(X, C, sigma):
+    N = X.shape[0]
+    K = rbf_kernel(X, X, sigma)
+    H = K + np.eye(N) / C
+    e = np.ones((N, 1))
+    H_inv = np.linalg.inv(H)
+    alpha = H_inv @ e / (e.T @ H_inv @ e)
+    rho = 1 / (e.T @ H_inv @ e)
+    return alpha, rho, X
+
+def compute_control_limit(X_train, C, sigma, confidence_level=0.05, B=1000):
+    N = X_train.shape[0]
+    bootstrap_statistics = []
+    for _ in range(B):
+        bootstrap_indices = np.random.choice(N, size=N, replace=True)
+        X_bootstrap = X_train[bootstrap_indices]
+        K_bootstrap = rbf_kernel(X_bootstrap, X_bootstrap, sigma)
+        H_bootstrap = K_bootstrap + np.eye(N) / C
+        e = np.ones((N, 1))
+        H_inv_bootstrap = np.linalg.inv(H_bootstrap)
+        alpha_bootstrap = H_inv_bootstrap @ e / (e.T @ H_inv_bootstrap @ e)
+        rho_bootstrap = 1 / (e.T @ H_inv_bootstrap @ e)
+        decision_values = np.abs(K_bootstrap @ alpha_bootstrap - rho_bootstrap).flatten()
+        bootstrap_statistics.extend(decision_values)
+    bootstrap_statistics = np.sort(bootstrap_statistics)
+    h_index = int((1 - confidence_level) * len(bootstrap_statistics)) - 1
+    return bootstrap_statistics[h_index]
+
+def lsocsvm_predict_with_h(alpha, rho, X_train, X_test, sigma, h):
+    K_test = rbf_kernel(X_test, X_train, sigma)
+    decision_values = np.abs(K_test @ alpha - rho)
+    predictions = np.where(decision_values < h, 1, -1)
+    return predictions, decision_values
+
+#======================#
+# Carregar base de dados#
+#======================#
+
+data = pd.read_csv('/content/2dados_envase_com_limites.csv')
+data['classe'] = data['classe'].map({'em_controle': 1, 'fora_controle': -1})
+
+X = data.drop(columns=['classe']).values
+Y = data['classe'].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+
+train_indices = np.where(Y == 1)[0]
+X_train = X_pca[train_indices]
+
+X_test = X_pca
+Y_test = Y
+
+#======================#
+# PSO para otimização   #
+#======================#
+
+def fitness_function(params, train_data):
+    errors = []
+    for param_set in params:
+        C, sigma = param_set
+        if C <= 0 or sigma <= 0:
+            errors.append(1e6)
+            continue
+        try:
+            alpha, rho, X_used = lsocsvm_fit(train_data, C, sigma)
+            pred, dv = lsocsvm_predict_with_h(alpha, rho, X_used, X_used, sigma, h=1e9)
+            mse = mean_squared_error(np.ones(len(train_data)), np.sign(pred))
+            errors.append(mse)
+        except Exception:
+            errors.append(1e6)
+    return np.array(errors)
+
+def tune_parameters(train_data):
+    bounds = ([0.01, 0.01], [100, 20])
+    options = {'c1': 0.5, 'c2': 0.3, 'w': 0.9}
+    optimizer = ps.single.GlobalBestPSO(n_particles=30, dimensions=2, options=options, bounds=bounds)
+    best_cost, best_pos = optimizer.optimize(fitness_function, iters=50, train_data=train_data)
+    best_C, best_sigma = best_pos
+    return best_C, best_sigma
+
+C, sigma = tune_parameters(X_train)
+print("Melhores parâmetros -> C:", C, " sigma:", sigma)
+
+#======================#
+# Treinamento final    #
+#======================#
+
+alpha, rho, X_train_used = lsocsvm_fit(X_train, C, sigma)
+confidence_level = 0.05
+h = compute_control_limit(X_train, C, sigma, confidence_level)
+print("h =", h)
+
+#======================#
+# Predição e métricas  #
+#======================#
+
+predictions, decision_values = lsocsvm_predict_with_h(alpha, rho, X_train, X_test, sigma, h)
+outliers = decision_values > h
+
+print("Predictions (1=IC, -1=OC):", predictions)
+print("Decision Values:", decision_values.flatten())
+
+# Métricas de desempenho
+acc = accuracy_score(Y_test, predictions)
+cm = confusion_matrix(Y_test, predictions, labels=[1, -1])
+tn, fp, fn, tp = cm.ravel()
+fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+arl0 = 1 / fpr if fpr > 0 else float('inf')
+arl1 = 1 / (1 - fnr) if fnr < 1 else float('inf')
+
+print(f"\nAcurácia: {acc:.4f}")
+print(f"FPR: {fpr:.4f}, FNR: {fnr:.4f}")
+print(f"ARL0: {arl0:.2f}, ARL1: {arl1:.2f}")
+print("\nMatriz de confusão:")
+print(cm)
+print("\nRelatório:")
+print(classification_report(Y_test, predictions, target_names=["Em controle", "Fora de controle"]))
+
+#======================#
+# Gráficos             #
+#======================#
+
+def plot_decision_boundary_with_h(X_train, alpha, rho, sigma, h, X_test=None, title="Decision Boundary"):
+    if X_train.shape[1] != 2:
+        raise ValueError("Plotting is only supported for 2D data.")
+    x_min, x_max = X_train[:, 0].min() - 1, X_train[:, 0].max() + 1
+    y_min, y_max = X_train[:, 1].min() - 1, X_train[:, 1].max() + 1
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 300),
+                         np.linspace(y_min, y_max, 300))
+    grid_points = np.c_[xx.ravel(), yy.ravel()]
+    K_grid = rbf_kernel(grid_points, X_train, sigma)
+    decision_vals_grid = np.abs(K_grid @ alpha - rho).reshape(xx.shape)
+
+    plt.figure(figsize=(8, 6))
+    contour = plt.contourf(xx, yy, decision_vals_grid, levels=50, cmap="coolwarm", alpha=0.5)
+    plt.colorbar(contour, label="Decision Value f(x)")
+    plt.contour(xx, yy, decision_vals_grid, levels=[h], colors="black", linewidths=2, linestyles="--")
+    plt.scatter(X_train[:, 0], X_train[:, 1], c="blue", edgecolor="k", label="Training Data")
+    if X_test is not None:
+        plt.scatter(X_test[:, 0], X_test[:, 1], c="red", edgecolor="k", label="Test Data", marker="x")
+    plt.title(title)
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.legend()
+    plt.grid(alpha=0.5)
+    plt.show()
+
+plot_decision_boundary_with_h(X_train, alpha, rho, sigma, h, X_test)
+
+plt.figure(figsize=(10, 6))
+plt.plot(range(len(decision_values)), decision_values, 'bo-', label="Decision Values")
+plt.axhline(y=h, color='red', linestyle='--', label="Control Limit (95%)")
+plt.scatter(np.where(outliers)[0], decision_values[outliers], color='red', label="Outliers", zorder=5)
+plt.title("Control Chart for LS-OCSVM")
+plt.xlabel("Sample Index")
+plt.ylabel("Decision Score")
+plt.legend(loc="upper left")
+plt.grid(True)
+plt.show()
+
+print("C =", C, " sigma =", sigma)
